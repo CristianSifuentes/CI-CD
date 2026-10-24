@@ -1,0 +1,12 @@
+// Reglas de estilo para la documentación (markdownlint-cli2).
+{
+  "config": {
+    "default": true,
+    "MD013": false,                       // líneas largas: las tablas lo requieren
+    "MD024": { "siblings_only": true },   // encabezados repetidos sólo entre hermanos
+    "MD033": false,                       // HTML embebido permitido (<details>, <br/>)
+    "MD036": false                        // negritas como subtítulos cortos
+  },
+  "globs": ["**/*.md"],
+  "ignores": ["**/node_modules/**", "**/.terraform/**"]
+}

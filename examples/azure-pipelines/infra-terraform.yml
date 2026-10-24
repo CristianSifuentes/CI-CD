@@ -1,0 +1,113 @@
+# =============================================================================
+# Terraform en Azure Pipelines con Workload Identity Federation (sin secretos)
+#
+#   Plan (PR y main) ──► Apply (sólo main, environment con aprobación)
+#
+# Autenticación: AzureCLI@2 con addSpnToEnvironment expone $servicePrincipalId,
+# $tenantId e $idToken (token federado) a tu script; el provider azurerm y el
+# backend los usan vía ARM_USE_OIDC/ARM_OIDC_TOKEN. El token dura poco: para
+# applies muy largos usa ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID + SYSTEM_ACCESSTOKEN
+# (el provider pide tokens nuevos por su cuenta).
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - infra/terraform
+
+variables:
+  workDir: $(Build.SourcesDirectory)/infra/terraform
+  planConnection: sc-miapp-infra-plan    # Reader + Storage Blob Data Contributor (estado)
+  applyConnection: sc-miapp-infra-apply  # Contributor sobre el alcance gestionado
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+pool:
+  vmImage: ubuntu-24.04
+
+stages:
+- stage: Plan
+  displayName: 'terraform plan'
+  jobs:
+  - job: plan
+    timeoutInMinutes: 30
+    steps:
+    - checkout: self
+      fetchDepth: 1
+    - template: templates/steps-terraform-install.yml
+
+    - task: AzureCLI@2
+      name: tfplan
+      displayName: 'init + validate + plan'
+      inputs:
+        azureSubscription: $(planConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        workingDirectory: $(workDir)
+        inlineScript: |
+          set -euo pipefail
+          export ARM_USE_OIDC=true
+          export ARM_CLIENT_ID="$servicePrincipalId"
+          export ARM_TENANT_ID="$tenantId"
+          export ARM_OIDC_TOKEN="$idToken"
+          ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          export ARM_SUBSCRIPTION_ID
+          export TF_IN_AUTOMATION=true TF_INPUT=false
+
+          terraform fmt -check -recursive
+          terraform init -backend-config=backend.hcl
+          terraform validate
+          ec=0
+          terraform plan -var-file=prod.tfvars -out=tfplan -lock-timeout=5m -detailed-exitcode || ec=$?
+          if [ "$ec" -eq 1 ]; then exit 1; fi
+          # Variable de salida para decidir si hay algo que aplicar.
+          echo "##vso[task.setvariable variable=changes;isOutput=true]$([ "$ec" -eq 2 ] && echo true || echo false)"
+
+    # El plan incluye valores sensibles: sólo se publica en main y con cambios.
+    - publish: $(workDir)/tfplan
+      artifact: tfplan
+      displayName: 'Publicar plan'
+      condition: and(succeeded(), eq(variables.isMain, 'true'), eq(variables['tfplan.changes'], 'true'))
+
+- stage: Apply
+  displayName: 'terraform apply'
+  dependsOn: Plan
+  condition: and(succeeded(), eq(variables.isMain, 'true'), eq(dependencies.Plan.outputs['plan.tfplan.changes'], 'true'))
+  jobs:
+  - deployment: apply
+    environment: infra-prod                # configura aquí la aprobación manual
+    timeoutInMinutes: 60
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self                  # los deployment jobs no hacen checkout solos
+            fetchDepth: 1
+          - download: current
+            artifact: tfplan
+          - template: templates/steps-terraform-install.yml
+
+          - task: AzureCLI@2
+            displayName: 'init + apply (plan aprobado)'
+            inputs:
+              azureSubscription: $(applyConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(workDir)
+              inlineScript: |
+                set -euo pipefail
+                export ARM_USE_OIDC=true
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_OIDC_TOKEN="$idToken"
+                ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                export ARM_SUBSCRIPTION_ID
+                export TF_IN_AUTOMATION=true TF_INPUT=false
+
+                terraform init -backend-config=backend.hcl
+                # Si el estado cambió desde el plan, Terraform lo rechaza como "stale".
+                terraform apply -lock-timeout=5m "$(Pipeline.Workspace)/tfplan/tfplan"

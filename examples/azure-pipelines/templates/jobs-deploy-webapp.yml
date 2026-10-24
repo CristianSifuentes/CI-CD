@@ -1,0 +1,70 @@
+# Plantilla de job de despliegue (deployment job) para Azure App Service (Linux).
+#
+# - Usa un "environment" de Azure Pipelines: ahí se configuran aprobaciones y
+#   checks (business hours, Azure Monitor alerts, invoke REST API, etc.).
+# - Se autentica con una service connection de Azure Resource Manager con
+#   Workload Identity Federation (sin secretos).
+# - Despliega el artefacto inmutable generado en la etapa Build.
+
+parameters:
+- name: environment
+  type: string               # p. ej. miapp-dev (se crea solo la primera vez)
+- name: serviceConnection
+  type: string               # service connection ARM con WIF (federada)
+- name: resourceGroup
+  type: string
+- name: appName
+  type: string
+- name: slotName
+  type: string
+  default: production        # 'staging' para desplegar al slot de preproducción
+- name: artifactName
+  type: string
+  default: drop
+- name: healthPath
+  type: string
+  default: /healthz
+
+jobs:
+- deployment: deploy_${{ replace(parameters.environment, '-', '_') }}
+  displayName: 'Desplegar ${{ parameters.appName }} (${{ parameters.slotName }})'
+  environment: ${{ parameters.environment }}
+  timeoutInMinutes: 30
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        # En deployment jobs el artefacto se descarga solo; lo hacemos explícito
+        # para bajar únicamente el que necesitamos.
+        - download: current
+          artifact: ${{ parameters.artifactName }}
+
+        - task: AzureWebApp@1
+          displayName: 'Desplegar paquete'
+          inputs:
+            azureSubscription: ${{ parameters.serviceConnection }}
+            appType: webAppLinux
+            appName: ${{ parameters.appName }}
+            deployToSlotOrASE: true
+            resourceGroupName: ${{ parameters.resourceGroup }}
+            slotName: ${{ parameters.slotName }}
+            package: $(Pipeline.Workspace)/${{ parameters.artifactName }}/*.zip
+
+        - task: AzureCLI@2
+          displayName: 'Smoke test (${{ parameters.healthPath }})'
+          inputs:
+            azureSubscription: ${{ parameters.serviceConnection }}
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              set -euo pipefail
+              if [ "${{ parameters.slotName }}" = "production" ]; then
+                host=$(az webapp show -g "${{ parameters.resourceGroup }}" -n "${{ parameters.appName }}" \
+                  --query defaultHostName -o tsv)
+              else
+                host=$(az webapp show -g "${{ parameters.resourceGroup }}" -n "${{ parameters.appName }}" \
+                  --slot "${{ parameters.slotName }}" --query defaultHostName -o tsv)
+              fi
+              echo "Probando https://${host}${{ parameters.healthPath }}"
+              curl --fail --silent --show-error --retry 10 --retry-delay 6 --retry-all-errors \
+                --max-time 10 "https://${host}${{ parameters.healthPath }}"

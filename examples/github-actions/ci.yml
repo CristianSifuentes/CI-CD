@@ -1,0 +1,89 @@
+# =============================================================================
+# CI para una API .NET: build, pruebas, cobertura y revisión de dependencias.
+# Copia este archivo a .github/workflows/ci.yml
+#
+# Buenas prácticas aplicadas:
+#   * permissions mínimos (contents: read) a nivel de workflow.
+#   * Acciones fijadas por SHA completo (con el tag en comentario). Dependabot
+#     sabe actualizar este formato. Alternativa 2026: lockfile de dependencias.
+#   * concurrency: cancela ejecuciones viejas del mismo PR.
+#   * timeout-minutes en cada job (el default de 6 h es un riesgo de costo).
+#   * Imagen de runner explícita (ubuntu-24.04) en lugar de "-latest".
+# =============================================================================
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    name: Build y pruebas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar .NET 10
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+          cache: true                                  # caché de NuGet
+          cache-dependency-path: '**/packages.lock.json'
+
+      - name: Restore (locked-mode)
+        run: dotnet restore --locked-mode
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Test + cobertura
+        run: >-
+          dotnet test --no-build --configuration Release
+          --collect "XPlat Code Coverage"
+          --logger trx
+          --results-directory TestResults
+
+      - name: Publicar resultados de pruebas
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results
+          path: TestResults
+          retention-days: 7
+
+  dependency-review:
+    name: Revisión de dependencias
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Bloquea PRs que introducen dependencias con vulnerabilidades altas o
+      # licencias no permitidas.
+      - name: Dependency review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          deny-licenses: AGPL-3.0-only, AGPL-3.0-or-later

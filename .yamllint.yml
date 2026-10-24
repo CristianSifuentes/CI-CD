@@ -1,0 +1,15 @@
+# Reglas de estilo para los YAML del repositorio (pipelines y workflows).
+extends: default
+
+rules:
+  document-start: disable
+  line-length:
+    max: 160
+    level: warning
+  truthy:
+    check-keys: false      # "on:" de GitHub Actions
+  comments:
+    min-spaces-from-content: 1
+  indentation:
+    spaces: 2
+    indent-sequences: whatever

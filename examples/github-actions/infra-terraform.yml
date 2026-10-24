@@ -1,0 +1,147 @@
+# =============================================================================
+# Terraform con OIDC: plan en cada PR, apply aprobado del plan guardado en main.
+# Copia este archivo a .github/workflows/ y el código a infra/terraform/
+#
+# Identidades (mínimo privilegio, sin secretos):
+#   * "plan"  → Reader en la suscripción + Storage Blob Data Contributor sobre el
+#               contenedor del estado. Credenciales federadas: pull_request y
+#               refs/heads/main. Variables de repo: AZURE_CLIENT_ID, AZURE_TENANT_ID,
+#               AZURE_SUBSCRIPTION_ID.
+#   * "apply" → Contributor (o roles específicos) sobre el alcance gestionado.
+#               Credencial federada: environment:infra-prod. El environment
+#               infra-prod sobrescribe AZURE_CLIENT_ID y exige revisores.
+# =============================================================================
+name: Infra - Terraform
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['infra/terraform/**']
+  push:
+    branches: [main]
+    paths: ['infra/terraform/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PRs: un grupo por rama (se cancela el plan viejo). main: un solo apply a la vez
+# y nunca se cancela. Grupos separados evitan que un PR cancele un apply pendiente.
+concurrency:
+  group: terraform-${{ github.event_name == 'pull_request' && github.head_ref || 'prod' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TF_VERSION: 1.17.0
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+  WORKDIR: infra/terraform
+  # El provider azurerm y el backend leen estas variables (OIDC).
+  ARM_USE_OIDC: 'true'
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      changes: ${{ steps.plan.outputs.changes }}
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: fmt
+        run: terraform fmt -check -recursive
+
+      - name: init
+        run: terraform init -backend-config=backend.hcl
+
+      - name: validate
+        run: terraform validate
+
+      - name: plan
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -var-file=prod.tfvars -out=tfplan -lock-timeout=5m -detailed-exitcode \
+            || ec=$?; ec=${ec:-0}
+          # 0 = sin cambios, 2 = hay cambios, 1 = error
+          if [ "$ec" -eq 1 ]; then exit 1; fi
+          echo "changes=$([ "$ec" -eq 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Terraform plan'
+            echo '```text'
+            terraform show -no-color tfplan | tail -n 200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # El plan contiene valores sensibles: retención mínima.
+      - name: Guardar plan
+        if: github.event_name != 'pull_request' && steps.plan.outputs.changes == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tfplan
+          path: ${{ env.WORKDIR }}/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  apply:
+    name: Apply (aprobado)
+    needs: plan
+    if: github.event_name != 'pull_request' && needs.plan.outputs.changes == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: infra-prod
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Descargar plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan
+          path: ${{ env.WORKDIR }}
+
+      - name: init
+        run: terraform init -backend-config=backend.hcl
+
+      # Aplica exactamente lo que se revisó. Si el estado cambió desde el plan,
+      # Terraform rechaza el plan como "stale" (comportamiento deseado).
+      - name: apply
+        run: terraform apply -lock-timeout=5m tfplan

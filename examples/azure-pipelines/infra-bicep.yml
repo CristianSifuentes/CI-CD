@@ -1,0 +1,88 @@
+# =============================================================================
+# Bicep en Azure Pipelines: lint + what-if ──► deployment stack (aprobado)
+#
+# Deployment stacks gestionan los recursos como una unidad, con deny settings
+# contra borrados manuales. Son el reemplazo de Azure Blueprints (retiro
+# definitivo: 31-ene-2027).
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - infra/bicep
+
+variables:
+  serviceConnection: sc-miapp-infra-apply
+  resourceGroup: rg-miapp-prod
+  stackName: miapp-prod
+  templateFile: $(Build.SourcesDirectory)/infra/bicep/main.bicep
+  parametersFile: $(Build.SourcesDirectory)/infra/bicep/main.bicepparam
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+pool:
+  vmImage: ubuntu-24.04
+
+stages:
+- stage: Validate
+  displayName: 'Lint + what-if'
+  jobs:
+  - job: whatif
+    timeoutInMinutes: 20
+    steps:
+    - checkout: self
+      fetchDepth: 1
+
+    # Bicep CLI viene preinstalado en las imágenes hospedadas.
+    - script: bicep lint "$(templateFile)"
+      displayName: 'bicep lint'
+
+    - task: AzureCLI@2
+      displayName: 'what-if'
+      inputs:
+        azureSubscription: $(serviceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+          az deployment group what-if \
+            --resource-group "$(resourceGroup)" \
+            --template-file "$(templateFile)" \
+            --parameters "$(parametersFile)" \
+            --result-format FullResourcePayloads
+
+- stage: Deploy
+  displayName: 'Deployment stack'
+  dependsOn: Validate
+  condition: and(succeeded(), eq(variables.isMain, 'true'))
+  jobs:
+  - deployment: stack
+    environment: infra-prod
+    timeoutInMinutes: 45
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            fetchDepth: 1
+          - task: AzureCLI@2
+            displayName: 'az stack group create'
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                # detachAll: lo que quites del template deja de gestionarse pero
+                # no se borra. Cambia a deleteResources cuando confíes en el proceso.
+                az stack group create \
+                  --name "$(stackName)" \
+                  --resource-group "$(resourceGroup)" \
+                  --template-file "$(templateFile)" \
+                  --parameters "$(parametersFile)" \
+                  --action-on-unmanage detachAll \
+                  --deny-settings-mode denyDelete \
+                  --description "Infraestructura de miapp (prod)" \
+                  --yes

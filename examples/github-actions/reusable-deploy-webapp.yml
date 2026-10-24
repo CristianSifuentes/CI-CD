@@ -1,0 +1,103 @@
+# =============================================================================
+# Workflow reutilizable: despliega un artefacto a una Web App (o a un slot) con
+# OIDC (sin secretos) y verifica el health check.
+# Copia este archivo a .github/workflows/reusable-deploy-webapp.yml
+#
+# El job usa "environment", así que:
+#   * Las reglas de protección del environment (revisores, wait timer, ramas
+#     permitidas) se aplican antes de que el job reciba el token OIDC.
+#   * El "sub" del token OIDC es repo:<owner>/<repo>:environment:<nombre>
+#     (o el formato inmutable repo:<owner>@<id>/<repo>@<id>:environment:<nombre>
+#     en repos creados después del 15-jul-2026). Crea una credencial federada
+#     en Microsoft Entra por cada environment.
+# =============================================================================
+name: Reusable - Deploy Web App
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Environment de GitHub (dev, staging, production)
+        required: true
+        type: string
+      app-name:
+        required: true
+        type: string
+      resource-group:
+        required: true
+        type: string
+      slot-name:
+        description: production o el nombre del slot (p. ej. staging)
+        required: false
+        type: string
+        default: production
+      artifact-name:
+        required: false
+        type: string
+        default: webapp
+      health-path:
+        required: false
+        type: string
+        default: /healthz
+    outputs:
+      url:
+        description: URL verificada
+        value: ${{ jobs.deploy.outputs.url }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.app-name }} (${{ inputs.slot-name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.health.outputs.url }}
+    permissions:
+      id-token: write   # necesario para pedir el token OIDC
+      contents: read
+    outputs:
+      url: ${{ steps.health.outputs.url }}
+    steps:
+      - name: Descargar artefacto
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: package
+
+      # Variables (no secretos): AZURE_CLIENT_ID, AZURE_TENANT_ID y
+      # AZURE_SUBSCRIPTION_ID definidas como variables del environment.
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Desplegar
+        uses: azure/webapps-deploy@02a81bead70021f5284939794bcec79c271ab383 # v3.0.8
+        with:
+          app-name: ${{ inputs.app-name }}
+          resource-group-name: ${{ inputs.resource-group }}
+          slot-name: ${{ inputs.slot-name }}
+          package: package
+
+      - name: Health check
+        id: health
+        env:
+          APP: ${{ inputs.app-name }}
+          RG: ${{ inputs.resource-group }}
+          SLOT: ${{ inputs.slot-name }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+        run: |
+          set -euo pipefail
+          if [ "$SLOT" = "production" ]; then
+            host=$(az webapp show -g "$RG" -n "$APP" --query defaultHostName -o tsv)
+          else
+            host=$(az webapp show -g "$RG" -n "$APP" --slot "$SLOT" --query defaultHostName -o tsv)
+          fi
+          curl --fail --silent --show-error --retry 10 --retry-delay 6 --retry-all-errors \
+            --max-time 10 "https://${host}${HEALTH_PATH}"
+          echo "url=https://${host}" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,89 @@
+# Plantilla de pasos (steps template): compila, prueba, mide cobertura y publica
+# un paquete .zip listo para desplegar. Se invoca desde webapp-ci-cd.yml.
+#
+# Uso:
+#   steps:
+#   - template: templates/steps-dotnet-build.yml
+#     parameters:
+#       projects: 'src/MiApp.Api/MiApp.Api.csproj'
+
+parameters:
+- name: dotnetVersion
+  type: string
+  default: '10.0.x'          # .NET 10 es la LTS vigente (soporte hasta nov-2028)
+- name: configuration
+  type: string
+  default: Release
+- name: projects
+  type: string               # proyecto(s) web a publicar
+- name: testProjects
+  type: string
+  default: 'tests/**/*.Tests.csproj'
+- name: artifactName
+  type: string
+  default: drop
+
+steps:
+- checkout: self
+  fetchDepth: 1              # clon superficial: más rápido
+  persistCredentials: false  # no deja el token en .git/config
+
+- task: UseDotNet@2
+  displayName: 'Instalar .NET SDK ${{ parameters.dotnetVersion }}'
+  inputs:
+    packageType: sdk
+    version: ${{ parameters.dotnetVersion }}
+
+# Caché de paquetes NuGet: la llave cambia sólo si cambian los lock files.
+# Requiere <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile> en los .csproj.
+- task: Cache@2
+  displayName: 'Caché de NuGet'
+  inputs:
+    key: 'nuget | "$(Agent.OS)" | **/packages.lock.json,!**/bin/**,!**/obj/**'
+    restoreKeys: |
+      nuget | "$(Agent.OS)"
+    path: $(NUGET_PACKAGES)
+
+- script: dotnet restore ${{ parameters.projects }} --locked-mode
+  displayName: 'dotnet restore (locked-mode)'
+
+- script: >-
+    dotnet build ${{ parameters.projects }}
+    --configuration ${{ parameters.configuration }}
+    --no-restore
+  displayName: 'dotnet build'
+
+- task: DotNetCoreCLI@2
+  displayName: 'dotnet test + cobertura'
+  inputs:
+    command: test
+    projects: ${{ parameters.testProjects }}
+    arguments: >-
+      --configuration ${{ parameters.configuration }}
+      --collect "XPlat Code Coverage"
+    # Agrega --logger trx y --results-directory $(Agent.TempDirectory) por su cuenta
+    # (no los repitas en arguments) y publica los resultados en la pestaña Tests.
+    publishTestResults: true
+
+# "XPlat Code Coverage" requiere el paquete coverlet.collector en los proyectos de pruebas.
+- task: PublishCodeCoverageResults@2
+  displayName: 'Publicar cobertura'
+  inputs:
+    summaryFileLocation: $(Agent.TempDirectory)/**/coverage.cobertura.xml
+
+- task: DotNetCoreCLI@2
+  displayName: 'dotnet publish (zip)'
+  inputs:
+    command: publish
+    publishWebProjects: false
+    projects: ${{ parameters.projects }}
+    arguments: >-
+      --configuration ${{ parameters.configuration }}
+      --output $(Build.ArtifactStagingDirectory)/app
+    zipAfterPublish: true
+
+# "Build once, deploy many": este mismo artefacto inmutable se promueve a
+# todos los ambientes. Nunca se recompila por ambiente.
+- publish: $(Build.ArtifactStagingDirectory)/app
+  artifact: ${{ parameters.artifactName }}
+  displayName: 'Publicar artefacto ${{ parameters.artifactName }}'
