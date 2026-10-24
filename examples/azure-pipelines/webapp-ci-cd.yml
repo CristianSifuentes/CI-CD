@@ -1,0 +1,150 @@
+# =============================================================================
+# Pipeline multi-etapa (YAML) para una API .NET en Azure App Service (Linux)
+#
+#   Build ──► Dev ──► Staging (slot) ──► Prod (swap staging → production)
+#
+# Principios que aplica:
+#   * Build once, deploy many: un solo artefacto inmutable para todos los ambientes.
+#   * Identidad sin secretos: service connections ARM con Workload Identity
+#     Federation (emisor Microsoft Entra).
+#   * Gates en el "environment" (aprobaciones y checks se configuran en la UI de
+#     Pipelines > Environments, no en el YAML, para que nadie los quite en un PR).
+#   * Cero downtime: se despliega al slot "staging" y se hace swap (con warm-up).
+#   * Rollback automático: si la verificación posterior al swap falla, un
+#     segundo swap regresa la versión anterior (sólo si el swap sí ocurrió).
+#
+# Prerrequisitos: ver examples/README.md
+# =============================================================================
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  batch: true
+  branches:
+    include:
+    - main
+  paths:
+    exclude:
+    - docs/**
+    - '**/*.md'
+
+# "pr:" aplica a repos de GitHub/Bitbucket. En Azure Repos, la validación de PR
+# se configura con una branch policy (Build validation) apuntando a este pipeline.
+pr:
+  branches:
+    include:
+    - main
+  paths:
+    exclude:
+    - docs/**
+    - '**/*.md'
+
+parameters:
+- name: deployToProd
+  displayName: 'Promover a producción'
+  type: boolean
+  default: true
+
+variables:
+  buildConfiguration: Release
+  NUGET_PACKAGES: $(Pipeline.Workspace)/.nuget/packages   # usado por Cache@2
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+pool:
+  vmImage: ubuntu-24.04      # imagen explícita: evita sorpresas cuando cambia "-latest"
+
+stages:
+# -----------------------------------------------------------------------------
+- stage: Build
+  displayName: 'Build y pruebas'
+  jobs:
+  - job: build
+    displayName: 'Compilar, probar y empaquetar'
+    timeoutInMinutes: 30
+    steps:
+    - template: templates/steps-dotnet-build.yml
+      parameters:
+        projects: src/MiApp.Api/MiApp.Api.csproj
+        configuration: $(buildConfiguration)
+
+# -----------------------------------------------------------------------------
+- stage: Dev
+  displayName: 'Dev'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables.isMain, 'true'))
+  jobs:
+  - template: templates/jobs-deploy-webapp.yml
+    parameters:
+      environment: miapp-dev
+      serviceConnection: sc-miapp-dev
+      resourceGroup: rg-miapp-dev
+      appName: app-miapp-dev
+
+# -----------------------------------------------------------------------------
+- stage: Staging
+  displayName: 'Staging (slot)'
+  dependsOn: Dev
+  condition: and(succeeded(), eq(variables.isMain, 'true'))
+  jobs:
+  - template: templates/jobs-deploy-webapp.yml
+    parameters:
+      environment: miapp-staging
+      serviceConnection: sc-miapp-prod      # el slot vive en la app de producción
+      resourceGroup: rg-miapp-prod
+      appName: app-miapp-prod
+      slotName: staging
+
+# -----------------------------------------------------------------------------
+- stage: Prod
+  displayName: 'Producción (swap)'
+  dependsOn: Staging
+  condition: and(succeeded(), eq(variables.isMain, 'true'), eq('${{ parameters.deployToProd }}', 'true'))
+  jobs:
+  - deployment: swap_prod
+    displayName: 'Swap staging → production'
+    environment: miapp-prod                 # aquí van las aprobaciones manuales
+    timeoutInMinutes: 30
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none                  # el swap no necesita el artefacto
+
+          - task: AzureAppServiceManage@0
+            displayName: 'Swap de slots (staging → production)'
+            inputs:
+              azureSubscription: sc-miapp-prod
+              Action: 'Swap Slots'
+              WebAppName: app-miapp-prod
+              ResourceGroupName: rg-miapp-prod
+              SourceSlot: staging
+              SwapWithProduction: true
+
+          # Sólo se ejecuta si el swap terminó bien: habilita el rollback.
+          - bash: echo "##vso[task.setvariable variable=swapped]true"
+            displayName: 'Marcar swap realizado'
+
+          - task: AzureCLI@2
+            displayName: 'Verificación post-swap'
+            inputs:
+              azureSubscription: sc-miapp-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                host=$(az webapp show -g rg-miapp-prod -n app-miapp-prod --query defaultHostName -o tsv)
+                curl --fail --silent --show-error --retry 10 --retry-delay 6 --retry-all-errors \
+                  --max-time 10 "https://${host}/healthz"
+
+          # Rollback automático e idempotente: si algo falló DESPUÉS del swap,
+          # un segundo swap devuelve la versión anterior (que quedó en staging).
+          - task: AzureAppServiceManage@0
+            displayName: 'Rollback (swap de regreso)'
+            condition: and(failed(), eq(variables['swapped'], 'true'))
+            inputs:
+              azureSubscription: sc-miapp-prod
+              Action: 'Swap Slots'
+              WebAppName: app-miapp-prod
+              ResourceGroupName: rg-miapp-prod
+              SourceSlot: staging
+              SwapWithProduction: true

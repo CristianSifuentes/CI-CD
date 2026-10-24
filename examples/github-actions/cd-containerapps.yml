@@ -1,0 +1,192 @@
+# =============================================================================
+# CD blue-green para Azure Container Apps (revisiones + etiquetas + tráfico)
+# Copia este archivo a .github/workflows/
+#
+#   build-push ──► deploy-preview ──► promote (environment "production")
+#   imagen por     nueva revisión      100% del tráfico a la etiqueta nueva
+#   digest +       con 0% de tráfico   + verificación + rollback automático
+#   atestación     y URL de etiqueta
+#
+# Prerrequisitos (una sola vez, idealmente en IaC):
+#   * Container App con ingress y "--revisions-mode multiple".
+#   * Revisión inicial etiquetada "blue" con 100% del tráfico:
+#       az containerapp revision label add -n <app> -g <rg> --label blue --revision <rev> --yes
+#       az containerapp ingress traffic set -n <app> -g <rg> --label-weight blue=100
+#   * La identidad de la app con rol AcrPull sobre el ACR (sin usuario admin).
+#   * Variables de repo: AZURE_CLIENT_ID/TENANT_ID/SUBSCRIPTION_ID (identidad de
+#     CI, credencial federada para la rama main, roles AcrPush + Container Apps
+#     Contributor). El environment "production" puede sobrescribir
+#     AZURE_CLIENT_ID con otra identidad (credencial environment:production).
+# =============================================================================
+name: CD - Container Apps
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-containerapps
+  cancel-in-progress: false
+
+env:
+  ACR_NAME: crmiappprod              # nombre del Azure Container Registry
+  IMAGE_NAME: miapp-api
+  RESOURCE_GROUP: rg-miapp-prod
+  CONTAINER_APP: ca-miapp-api-prod
+
+jobs:
+  build-push:
+    name: Build y push (ACR)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Token de ACR derivado de la identidad federada: sin usuario admin ni secretos.
+      - name: Login a ACR
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Configurar Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Metadatos de imagen
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=main-{{date 'YYYYMMDD'}}-{{sha}}
+
+      - name: Build y push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max   # atestación SLSA de BuildKit adjunta a la imagen
+          sbom: true             # SBOM adjunto a la imagen
+
+      - name: Atestación de procedencia (GitHub)
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+
+  deploy-preview:
+    name: Nueva revisión (0% tráfico)
+    needs: build-push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      live: ${{ steps.revision.outputs.live }}
+      idle: ${{ steps.revision.outputs.idle }}
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Crear revisión y etiquetarla
+        id: revision
+        env:
+          DIGEST: ${{ needs.build-push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          live=$(az containerapp ingress traffic show -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
+            --query "[?weight==\`100\`].label | [0]" -o tsv)
+          if [ "$live" = "blue" ]; then idle=green; else idle=blue; fi
+
+          # Desplegar por digest (inmutable), nunca por tag mutable.
+          image="${ACR_NAME}.azurecr.io/${IMAGE_NAME}@${DIGEST}"
+          suffix="c${GITHUB_SHA::7}-r${GITHUB_RUN_ATTEMPT}"
+          az containerapp update -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
+            --image "$image" --revision-suffix "$suffix" --output none
+
+          # La etiqueta da una URL estable para probar sin tráfico real.
+          az containerapp revision label add -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
+            --label "$idle" --revision "${CONTAINER_APP}--${suffix}" --yes --output none
+
+          echo "live=$live" >> "$GITHUB_OUTPUT"
+          echo "idle=$idle" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test en la URL de la etiqueta
+        env:
+          IDLE: ${{ steps.revision.outputs.idle }}
+        run: |
+          set -euo pipefail
+          fqdn=$(az containerapp show -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          label_fqdn="${CONTAINER_APP}---${IDLE}.${fqdn#*.}"
+          curl --fail --silent --show-error --retry 10 --retry-delay 6 --retry-all-errors \
+            --max-time 10 "https://${label_fqdn}/healthz"
+
+  promote:
+    name: Promover a producción
+    needs: deploy-preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: production      # revisores requeridos antes de mover tráfico
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      LIVE: ${{ needs.deploy-preview.outputs.live }}
+      IDLE: ${{ needs.deploy-preview.outputs.idle }}
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Para canary, usa pesos intermedios (p. ej. 10/90) y valida métricas
+      # entre cada incremento antes de llegar a 100.
+      - name: Mover 100% del tráfico
+        id: switch
+        run: |
+          az containerapp ingress traffic set -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
+            --label-weight "${IDLE}=100" "${LIVE}=0" --output none
+
+      - name: Verificar producción
+        run: |
+          set -euo pipefail
+          fqdn=$(az containerapp show -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          curl --fail --silent --show-error --retry 10 --retry-delay 6 --retry-all-errors \
+            --max-time 10 "https://${fqdn}/healthz"
+
+      - name: Rollback (regresar el tráfico)
+        if: failure() && steps.switch.outcome == 'success'
+        run: |
+          az containerapp ingress traffic set -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
+            --label-weight "${LIVE}=100" "${IDLE}=0" --output none

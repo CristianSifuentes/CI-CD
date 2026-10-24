@@ -1,0 +1,23 @@
+# Instala una versión fija de Terraform verificando su checksum SHA-256.
+# (Terraform no viene preinstalado en las imágenes hospedadas de Ubuntu.)
+
+parameters:
+- name: version
+  type: string
+  default: '1.17.0'
+
+steps:
+- bash: |
+    set -euo pipefail
+    v='${{ parameters.version }}'
+    dir="$(Agent.ToolsDirectory)/terraform/${v}"
+    mkdir -p "$dir" && cd "$(Agent.TempDirectory)"
+    curl -fsSLO "https://releases.hashicorp.com/terraform/${v}/terraform_${v}_linux_amd64.zip"
+    curl -fsSLO "https://releases.hashicorp.com/terraform/${v}/terraform_${v}_SHA256SUMS"
+    grep "terraform_${v}_linux_amd64.zip" "terraform_${v}_SHA256SUMS" | sha256sum --check --strict
+    unzip -o -q "terraform_${v}_linux_amd64.zip" -d "$dir"
+    echo "##vso[task.prependpath]${dir}"
+  displayName: 'Instalar Terraform ${{ parameters.version }}'
+
+- script: terraform version
+  displayName: 'terraform version'

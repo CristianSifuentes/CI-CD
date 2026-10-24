@@ -1,0 +1,16 @@
+# Mantiene al día (con PRs agrupados y mensuales) las acciones fijadas por SHA
+# del workflow de validación y la versión del provider de Terraform del ejemplo.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      github-actions:
+        patterns: ['*']
+
+  - package-ecosystem: terraform
+    directory: /examples/terraform
+    schedule:
+      interval: monthly

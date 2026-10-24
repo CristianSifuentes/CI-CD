@@ -30,3 +30,36 @@
 *.exe
 *.out
 *.app
+
+# --- CI/CD, IaC y herramientas ---
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+# El backend real puede contener nombres de tu entorno; se versiona sólo el .example
+backend.hcl
+
+# Bicep / ARM (salida de compilación)
+*.compiled.json
+
+# Python / Node (scripts y linters locales)
+__pycache__/
+.venv/
+node_modules/
+
+# Editores y sistema operativo
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db

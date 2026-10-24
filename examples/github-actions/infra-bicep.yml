@@ -1,0 +1,109 @@
+# =============================================================================
+# Bicep: lint + what-if en PR; despliegue como deployment stack en main.
+# Copia este archivo a .github/workflows/ y el código a infra/bicep/
+#
+# Deployment stack = el conjunto de recursos se gestiona como unidad:
+#   * deny settings (denyDelete) protegen contra borrados manuales.
+#   * action-on-unmanage decide qué pasa con lo que quitas del template.
+# Reemplazo oficial de Azure Blueprints (retiro: 31-ene-2027).
+# =============================================================================
+name: Infra - Bicep
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['infra/bicep/**']
+  push:
+    branches: [main]
+    paths: ['infra/bicep/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bicep-${{ github.event_name == 'pull_request' && github.head_ref || 'prod' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RESOURCE_GROUP: rg-miapp-prod
+  TEMPLATE: infra/bicep/main.bicep
+  PARAMETERS: infra/bicep/main.bicepparam
+
+jobs:
+  # What-if requiere permisos de despliegue (Reader no basta): usa una
+  # identidad con Contributor sobre el resource group, credencial pull_request.
+  what-if:
+    name: Lint + what-if
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Bicep CLI viene preinstalado en los runners hospedados. El linter usa
+      # las reglas de bicepconfig.json (los errores rompen el job).
+      - name: Lint
+        run: bicep lint "$TEMPLATE"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-if
+        uses: azure/bicep-deploy@4dc076a544e5297d3aeb3cb972e7614e12f5a55b # v2.4.0
+        with:
+          type: deployment
+          operation: whatIf
+          scope: resourceGroup
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          resource-group-name: ${{ env.RESOURCE_GROUP }}
+          template-file: ${{ env.TEMPLATE }}
+          parameters-file: ${{ env.PARAMETERS }}
+
+  deploy:
+    name: Deployment stack
+    needs: what-if
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: infra-prod
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Crear/actualizar stack
+        id: stack
+        uses: azure/bicep-deploy@4dc076a544e5297d3aeb3cb972e7614e12f5a55b # v2.4.0
+        with:
+          type: deploymentStack
+          operation: create
+          name: miapp-prod
+          scope: resourceGroup
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          resource-group-name: ${{ env.RESOURCE_GROUP }}
+          template-file: ${{ env.TEMPLATE }}
+          parameters-file: ${{ env.PARAMETERS }}
+          action-on-unmanage-resources: detach   # usa delete cuando confíes en el proceso
+          deny-settings-mode: denyDelete
+          description: Infraestructura de miapp (prod)

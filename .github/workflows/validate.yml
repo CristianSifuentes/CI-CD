@@ -1,0 +1,157 @@
+# =============================================================================
+# Valida la documentación y los ejemplos en cada PR y en cada push a main.
+# Aplica las mismas prácticas que recomienda la guía: permisos mínimos,
+# acciones fijadas por SHA, herramientas con versión y checksum fijos,
+# timeout-minutes en cada job y concurrency.
+# =============================================================================
+name: Validar documentación y ejemplos
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  markdown:
+    name: Markdown y enlaces
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: markdownlint
+        run: npx --yes markdownlint-cli2@0.24.0
+
+      - name: Enlaces internos y anclas
+        run: python3 scripts/check_links.py .
+
+  yaml:
+    name: YAML y Azure Pipelines
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Esquema oficial de Azure Pipelines (microsoft/azure-pipelines-vscode), fijado por commit y checksum.
+      ADO_SCHEMA_URL: https://raw.githubusercontent.com/microsoft/azure-pipelines-vscode/e8090fd525cd6ba47d7685c698f3f51983e298c6/service-schema.json
+      ADO_SCHEMA_SHA256: f00a9630f6550204148634d9a13f634b5750a225559886effe09a751482f0459
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar herramientas (versiones fijas)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --disable-pip-version-check \
+            yamllint==1.38.0 jsonschema==4.26.0 PyYAML==6.0.3
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: yamllint
+        run: yamllint -c .yamllint.yml --strict .
+
+      - name: Esquema de Azure Pipelines
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/service-schema.json" "$ADO_SCHEMA_URL"
+          echo "$ADO_SCHEMA_SHA256  $RUNNER_TEMP/service-schema.json" | sha256sum --check --strict
+          python scripts/validate_azure_pipelines.py "$RUNNER_TEMP/service-schema.json" \
+            examples/azure-pipelines/*.yml examples/azure-pipelines/templates/*.yml
+
+  actions:
+    name: GitHub Actions (actionlint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar actionlint
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "$ACTIONLINT_SHA256  actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf actionlint.tar.gz actionlint
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      # shellcheck viene preinstalado en el runner: actionlint también revisa los bloques run:.
+      - name: Workflows del repositorio
+        run: actionlint -color .github/workflows/*.yml
+
+      # Los ejemplos viven fuera de .github/workflows: se copian a un repo temporal
+      # para que actionlint resuelva también los reusable workflows locales.
+      - name: Workflows de ejemplo
+        run: |
+          lint_dir="$RUNNER_TEMP/examples-lint"
+          mkdir -p "$lint_dir/.github/workflows"
+          cp examples/github-actions/*.yml "$lint_dir/.github/workflows/"
+          cd "$lint_dir" && git init --quiet && actionlint -color
+
+  bicep:
+    name: Bicep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BICEP_VERSION: 0.48.1
+      BICEP_SHA256: b09ec25a9d376c1f8e33ede6ed22b587f915ad68488d5db77a6f9541748c7f6e
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar Bicep CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/bicep" \
+            "https://github.com/Azure/bicep/releases/download/v${BICEP_VERSION}/bicep-linux-x64"
+          echo "$BICEP_SHA256  $RUNNER_TEMP/bicep" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/bicep"
+
+      - name: Lint y build
+        working-directory: examples/bicep
+        run: |
+          "$RUNNER_TEMP/bicep" lint main.bicep
+          "$RUNNER_TEMP/bicep" build main.bicep --stdout > /dev/null
+          "$RUNNER_TEMP/bicep" build-params main.bicepparam --stdout > /dev/null
+
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: examples/terraform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.17.0
+          terraform_wrapper: false
+
+      - name: fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: init (sin backend) y validate
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate

@@ -1,0 +1,8 @@
+# Copia a backend.hcl (no lo subas si contiene datos sensibles de tu entorno).
+# La identidad del pipeline necesita "Storage Blob Data Contributor" sobre el
+# contenedor del estado. El lock usa leases de blob.
+resource_group_name  = "rg-tfstate"
+storage_account_name = "sttfstatemiapp001"
+container_name       = "tfstate"
+key                  = "miapp/prod.tfstate"
+use_azuread_auth     = true
